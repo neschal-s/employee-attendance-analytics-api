@@ -11,7 +11,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -27,6 +27,37 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+
+
+# --------------------------------------------------------------------------- #
+# MongoDB indexes and application lifecycle
+# --------------------------------------------------------------------------- #
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create indexes when the application starts.
+    db.employees.create_index(
+        [("emp_code", 1)],
+        unique=True,
+        name="uq_employees_emp_code",
+    )
+
+    db.attendance_logs.create_index(
+        [("emp_code", 1), ("date", 1)],
+        unique=True,
+        name="uq_attendance_emp_code_date",
+    )
+
+    yield
+
+
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -84,10 +115,6 @@ def health():
             status_code=503,
             detail="Database unavailable",
         )
-
-
-
-
 
 
 @app.post("/employees", status_code=201)
