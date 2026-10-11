@@ -9,8 +9,8 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import date,datetime, timedelta, timezone
+from typing import Optional,Literal
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -78,11 +78,28 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+
+    # Convert punch-in to IST before comparing local shift times.
+    punch_time = punch_in.astimezone(IST)
+
+    start = punch_time.replace(
+        hour=h,
+        minute=m,
+        second=0,
+        microsecond=0,
+    )
+
+    elapsed_seconds = (punch_time - start).total_seconds()
+    elapsed_minutes = int(elapsed_seconds // 60)
+
+    # Late only when strictly more than 10 minutes late.
+    return elapsed_minutes if elapsed_seconds > 600 else 0
+
+
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -143,9 +160,26 @@ class EmployeeIn(BaseModel):
 class PunchInIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    emp_code: str
+
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
     punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    status: Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"] = "PRESENT"
+
+    @field_validator("punched_at")
+    @classmethod
+    def validate_punched_at(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return value
+
+        if isinstance(value, bool) or value < 100_000_000_000:
+            raise ValueError("punched_at must be an epoch-millisecond timestamp")
+
+        try:
+            datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            raise ValueError("punched_at is outside the supported timestamp range")
+
+        return value
 
 
 # --------------------------------------------------------------------------- #
@@ -203,29 +237,73 @@ def list_employees(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
+    # Confirm that the employee exists.
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Convert the supplied epoch milliseconds to UTC.
+    # If omitted, use the current UTC time.
+    if body.punched_at is not None:
+        ts = datetime.fromtimestamp(
+            body.punched_at // 1000,
+            tz=timezone.utc,
+        )
+    else:
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
+
+    # Determine the attendance date using IST.
+    ts_ist = ts.astimezone(IST)
+    date_str = ts_ist.date().isoformat()
+
+    # ABSENT and LEAVE records must not have punch-in timestamps.
+    if body.status in ("ABSENT", "LEAVE"):
+        raise HTTPException(
+            status_code=422,
+            detail="ABSENT and LEAVE statuses cannot be punched in",
+        )
+
+    # Use the unique (emp_code, date) index for concurrency safety.
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": date_str,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts_ist, emp["shift_start"]),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
+
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="Already punched in for this date",
+        )
+
     doc.pop("_id", None)
-    return doc
+
+    # API contract excludes internal MongoDB IDs.
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": int(ts.timestamp() * 1000),
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": doc["late_minutes"],
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+
 
 
 @app.get("/attendance")
