@@ -48,6 +48,18 @@ async def lifespan(app: FastAPI):
         name="uq_attendance_emp_code_date",
     )
 
+    # Support employee filtering by department and sorted employee codes.
+    db.employees.create_index(
+        [("department", 1), ("emp_code", 1)],
+        name="idx_employees_department_emp_code",
+    )
+
+    # Support attendance date-range queries and descending date sorting.
+    db.attendance_logs.create_index(
+        [("date", -1), ("emp_code", 1)],
+        name="idx_attendance_date_emp_code",
+    )
+    
     yield
 
 
