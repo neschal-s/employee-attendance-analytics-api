@@ -16,7 +16,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
+import re
+from datetime import date
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 load_dotenv()
@@ -59,7 +62,7 @@ async def lifespan(app: FastAPI):
         [("date", -1), ("emp_code", 1)],
         name="idx_attendance_date_emp_code",
     )
-    
+
     yield
 
 
@@ -92,20 +95,54 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     return max(0, int((punch_out - end).total_seconds() / 60))
 
 
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
+
+    model_config = ConfigDict(extra="forbid")
+    
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: EmailStr
+    department: str = Field(min_length=1, max_length=50)
     shift_start: str = "09:30"
     shift_end: str = "18:30"
     joined_on: str
 
+    @field_validator("email")
+    @classmethod
+    def validate_email_length(cls, value: str) -> str:
+        if len(value) > 120:
+            raise ValueError("email must be at most 120 characters")
+        return value
+
+    @field_validator("shift_start", "shift_end")
+    @classmethod
+    def validate_shift_time(cls, value: str) -> str:
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            raise ValueError("Time must be in HH:MM format")
+        return value
+
+
+    @field_validator("joined_on")
+    @classmethod
+    def validate_joined_on(cls, value: str) -> str:
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            raise ValueError("joined_on must be a valid YYYY-MM-DD date")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("joined_on must use YYYY-MM-DD format")
+        return value
+
+
 
 class PunchInIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     emp_code: str
     punched_at: Optional[int] = None
     status: str = "PRESENT"
@@ -131,13 +168,24 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+
+    # Store created_at as a UTC timestamp.
+    doc["created_at"] = datetime.now(timezone.utc)
+
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="emp_code already exists",
+        )
+
     doc.pop("_id", None)
     return doc
+
+
+
 
 
 @app.get("/employees")
