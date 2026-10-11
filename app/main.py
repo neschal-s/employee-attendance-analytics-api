@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
 
 load_dotenv()
 
@@ -69,9 +71,23 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
+
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        db.command("ping")
+        return {"status": "ok"}
+    except PyMongoError:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        )
+
+
+
+
 
 
 @app.post("/employees", status_code=201)
