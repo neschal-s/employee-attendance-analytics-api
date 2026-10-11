@@ -20,6 +20,8 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 import re
 from datetime import date
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from decimal import Decimal, ROUND_HALF_UP
+
 
 
 load_dotenv()
@@ -182,6 +184,32 @@ class PunchInIn(BaseModel):
         return value
 
 
+class PunchOutIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    punched_at: Optional[int] = None
+
+    @field_validator("punched_at")
+    @classmethod
+    def validate_punched_at(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return value
+
+        if isinstance(value, bool) or value < 100_000_000_000:
+            raise ValueError(
+                "punched_at must be an epoch-millisecond timestamp"
+            )
+
+        try:
+            datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            raise ValueError(
+                "punched_at is outside the supported timestamp range"
+            )
+
+        return value
+
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
@@ -333,6 +361,167 @@ def list_attendance(
     for d in page_docs:
         d["id"] = str(d.pop("_id"))
     return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+
+
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if body.punched_at is not None:
+        punched_out = datetime.fromtimestamp(
+            body.punched_at // 1000,
+            tz=timezone.utc,
+        )
+    else:
+        punched_out = datetime.now(timezone.utc).replace(microsecond=0)
+
+    punched_out_ist = punched_out.astimezone(IST)
+
+    # Find the most recent open attendance record at or before punch-out.
+    # This also allows overnight shifts to be closed the following day.
+    open_record = db.attendance_logs.find_one(
+    {
+        "emp_code": body.emp_code,
+        "punch_in": {"$ne": None},
+        "punch_out": None,
+    },
+    sort=[("punch_in", -1)],
+    )
+    
+
+    if not open_record:
+        closed_record = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$ne": None, "$lte": punched_out},
+            "punch_out": {"$ne": None},
+        },
+        sort=[("punch_in", -1)],
+        )
+
+        if closed_record:
+            raise HTTPException(
+                status_code=409,
+                detail="Attendance record already punched out",
+            )
+
+        raise HTTPException(
+            status_code=404,
+            detail="No open attendance record found",
+        )
+
+    punch_in_time = open_record["punch_in"]
+
+    # PyMongo normally returns naive UTC datetimes unless tz_aware=True.
+    if punch_in_time.tzinfo is None:
+        punch_in_time = punch_in_time.replace(tzinfo=timezone.utc)
+
+    punch_in_time = punch_in_time.replace(microsecond=0)
+    punched_out = punched_out.replace(microsecond=0)
+
+    elapsed_seconds = (punched_out - punch_in_time).total_seconds()
+
+    if elapsed_seconds <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out must be after punch-in",
+        )
+
+    if elapsed_seconds > 24 * 60 * 60:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be more than 24 hours after punch-in",
+        )
+
+    # Round work hours to 2 decimal places using ROUND_HALF_UP.
+    hours_decimal = (
+        Decimal(str(elapsed_seconds)) / Decimal("3600")
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    work_hours = float(hours_decimal)
+
+    # Calculate the applicable shift-end instant.
+    shift_end_hour, shift_end_minute = map(
+        int, emp["shift_end"].split(":")
+    )
+
+    punch_in_ist = punch_in_time.astimezone(IST)
+    shift_end = punch_in_ist.replace(
+        hour=shift_end_hour,
+        minute=shift_end_minute,
+        second=0,
+        microsecond=0,
+    )
+
+    # An overnight shift ends on the following calendar day.
+    shift_start_hour, shift_start_minute = map(
+        int, emp["shift_start"].split(":")
+    )
+    if (shift_end_hour, shift_end_minute) <= (
+        shift_start_hour, shift_start_minute
+    ):
+        shift_end += timedelta(days=1)
+
+    # If the punch-in is before the shift-end clock time on an
+    # overnight shift, shift_end may need to be on the next day.
+    if shift_end <= punch_in_ist:
+        shift_end += timedelta(days=1)
+
+    shift_end_utc = shift_end.astimezone(timezone.utc)
+    overtime_seconds = (punched_out - shift_end_utc).total_seconds()
+
+    # Overtime is counted only if the employee works at least 30
+    # minutes beyond the shift end.
+    if overtime_seconds >= 30 * 60:
+        overtime_minutes = int(overtime_seconds // 60)
+    else:
+        overtime_minutes = 0
+
+    half_day = work_hours < 4.50
+
+    # Conditional update prevents two concurrent punch-outs from
+    # both closing the same attendance record.
+    result = db.attendance_logs.update_one(
+        {
+            "_id": open_record["_id"],
+            "punch_out": None,
+        },
+        {
+            "$set": {
+                "punch_out": punched_out,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day,
+            }
+        },
+    )
+
+    if result.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record was already punched out",
+        )
+
+    return {
+        "emp_code": open_record["emp_code"],
+        "date": open_record["date"],
+        "status": open_record["status"],
+        "punch_in": int(punch_in_time.timestamp() * 1000),
+        "punch_out": int(punched_out.timestamp() * 1000),
+        "work_hours": work_hours,
+        "late_minutes": open_record.get("late_minutes", 0),
+        "overtime_minutes": overtime_minutes,
+        "half_day": half_day,
+        "history": open_record.get("history", []),
+    }
+
+
+
+
 
 
 # --------------------------------------------------------------------------- #
