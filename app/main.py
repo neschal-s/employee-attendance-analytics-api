@@ -776,6 +776,233 @@ def employee_monthly_analytics(
 
 
 
+
+@app.get("/analytics/departments/summary")
+def department_summary_analytics(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = Query(None),
+):
+    year, month_number = map(int, month.split("-"))
+    month_start = date(year, month_number, 1)
+    month_end = date(year, month_number, monthrange(year, month_number)[1])
+
+    pipeline = [
+        # Only employees who joined on or before the end of the month.
+        {
+            "$match": {
+                "joined_on": {"$lte": month_end.isoformat()},
+                **({"department": department} if department is not None else {}),
+            }
+        },
+        # Join each employee's attendance records for the requested month.
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"employee_code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$emp_code", "$$employee_code"]},
+                                    {"$gte": ["$date", month_start.isoformat()]},
+                                    {"$lte": ["$date", month_end.isoformat()]},
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "logs",
+            }
+        },
+        # Calculate employee-level metrics while preserving employees with no logs.
+        {
+            "$project": {
+                "_id": 0,
+                "department": 1,
+                "logs": 1,
+                "present_days": {
+                    "$sum": {
+                        "$map": {
+                            "input": {
+                                "$filter": {
+                                    "input": "$logs",
+                                    "as": "log",
+                                    "cond": {
+                                        "$and": [
+                                            {
+                                                "$in": [
+                                                    "$$log.status",
+                                                    ["PRESENT", "WFH", "ON_DUTY"],
+                                                ]
+                                            },
+                                            {
+                                                "$gte": [
+                                                    {
+                                                        "$dayOfWeek": {
+                                                            "$dateFromString": {
+                                                                "dateString": "$$log.date"
+                                                            }
+                                                        }
+                                                    },
+                                                    2,
+                                                ]
+                                            },
+                                            {
+                                                "$lte": [
+                                                    {
+                                                        "$dayOfWeek": {
+                                                            "$dateFromString": {
+                                                                "dateString": "$$log.date"
+                                                            }
+                                                        }
+                                                    },
+                                                    6,
+                                                ]
+                                            },
+                                        ]
+                                    },
+                                }
+                            },
+                            "as": "log",
+                            "in": {
+                                "$cond": [
+                                    {"$eq": ["$$log.half_day", True]},
+                                    0.5,
+                                    1,
+                                ]
+                            },
+                        }
+                    }
+                },
+                "work_hours_values": {
+                    "$map": {
+                        "input": {
+                            "$filter": {
+                                "input": "$logs",
+                                "as": "log",
+                                "cond": {
+                                    "$and": [
+                                        {
+                                            "$in": [
+                                                "$$log.status",
+                                                ["PRESENT", "WFH", "ON_DUTY"],
+                                            ]
+                                        },
+                                        {"$ne": ["$$log.work_hours", None]},
+                                    ]
+                                },
+                            }
+                        },
+                        "as": "log",
+                        "in": "$$log.work_hours",
+                    }
+                },
+                "late_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$logs",
+                            "as": "log",
+                            "cond": {
+                                "$gt": [{"$ifNull": ["$$log.late_minutes", 0]}, 0]
+                            },
+                        }
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {
+                        "$map": {
+                            "input": "$logs",
+                            "as": "log",
+                            "in": {"$ifNull": ["$$log.late_minutes", 0]},
+                        }
+                    }
+                },
+                "leave_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$logs",
+                            "as": "log",
+                            "cond": {"$eq": ["$$log.status", "LEAVE"]},
+                        }
+                    }
+                },
+                "on_duty_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$logs",
+                            "as": "log",
+                            "cond": {"$eq": ["$$log.status", "ON_DUTY"]},
+                        }
+                    }
+                },
+            }
+        },
+        # Group employee metrics by department.
+        {
+            "$group": {
+                "_id": "$department",
+                "headcount": {"$sum": 1},
+                "present_days": {"$sum": "$present_days"},
+                "work_hours_values": {"$push": "$work_hours_values"},
+                "late_count": {"$sum": "$late_count"},
+                "total_late_minutes": {"$sum": "$total_late_minutes"},
+                "leave_count": {"$sum": "$leave_count"},
+                "on_duty_count": {"$sum": "$on_duty_count"},
+            }
+        },
+        # Flatten work-hour arrays and calculate the record-level average.
+        {
+            "$project": {
+                "_id": 0,
+                "department": "$_id",
+                "headcount": 1,
+                "present_days": 1,
+                "work_hours_values": {
+                    "$reduce": {
+                        "input": "$work_hours_values",
+                        "initialValue": [],
+                        "in": {"$concatArrays": ["$$value", "$$this"]},
+                    }
+                },
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1,
+            }
+        },
+        {
+            "$project": {
+                "department": 1,
+                "headcount": 1,
+                "present_days": 1,
+                "avg_work_hours": {
+                    "$cond": [
+                        {"$gt": [{"$size": "$work_hours_values"}, 0]},
+                        {"$avg": "$work_hours_values"},
+                        None,
+                    ]
+                },
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1,
+            }
+        },
+        {"$sort": {"department": 1}},
+    ]
+
+    items = list(db.employees.aggregate(pipeline))
+
+    for item in items:
+        if item["avg_work_hours"] is not None:
+            item["avg_work_hours"] = round_half_up(item["avg_work_hours"], 2)
+        item["present_days"] = round_half_up(item["present_days"], 2)
+
+    return {"month": month, "items": items}
+
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
