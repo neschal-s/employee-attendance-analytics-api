@@ -21,7 +21,7 @@ import re
 from datetime import date
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from decimal import Decimal, ROUND_HALF_UP
-
+from calendar import monthrange
 
 
 load_dotenv()
@@ -113,6 +113,29 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
     return max(0, int((punch_out - end).total_seconds() / 60))
 
+def round_half_up(value, places=2):
+    """Round a numeric value using the assignment's HALF_UP rule."""
+    quantum = Decimal("1").scaleb(-places)
+    return float(
+        Decimal(str(value)).quantize(
+            quantum,
+            rounding=ROUND_HALF_UP,
+        )
+    )
+
+
+
+def count_working_days(start_date, end_date):
+    """Count weekdays inclusively, Monday through Friday."""
+    days = 0
+    current = start_date
+
+    while current <= end_date:
+        if current.weekday() < 5:
+            days += 1
+        current += timedelta(days=1)
+
+    return days
 
 
 
@@ -565,6 +588,190 @@ def punch_out(body: PunchOutIn):
     }
 
 
+
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly_analytics(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    # Verify the employee exists and retrieve their joining date.
+    employee = db.employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0, "emp_code": 1, "joined_on": 1},
+    )
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    year, month_number = map(int, month.split("-"))
+    month_start = date(year, month_number, 1)
+    month_end = date(year, month_number, monthrange(year, month_number)[1])
+
+    # Working days begin on the later of month_start and joined_on.
+    joined_on = date.fromisoformat(employee["joined_on"])
+    effective_start = max(month_start, joined_on)
+
+    # Generate the weekday count using MongoDB's date operators.
+    
+    # Count weekdays inclusively from the effective start through month end.
+    working_days = 0
+
+    if effective_start <= month_end:
+        working_days_result = list(db.employees.aggregate([
+            {"$match": {"emp_code": emp_code}},
+            {
+                "$project": {
+                    "days": {
+                        "$map": {
+                            "input": {
+                                "$range": [
+                                    0,
+                                    (month_end - effective_start).days + 1,
+                                ]
+                            },
+                            "as": "offset",
+                            "in": {
+                                "$dayOfWeek": {
+                                    "date": {
+                                        "$dateAdd": {
+                                            "startDate": {
+                                                "$dateFromString": {
+                                                    "dateString": effective_start.isoformat()
+                                                }
+                                            },
+                                            "unit": "day",
+                                            "amount": "$$offset",
+                                        }
+                                    },
+                                    "timezone": "UTC",
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+            {
+                "$project": {
+                    "working_days": {
+                        "$size": {
+                            "$filter": {
+                                "input": "$days",
+                                "as": "weekday",
+                                "cond": {
+                                    "$in": ["$$weekday", [2, 3, 4, 5, 6]]
+                                },
+                            }
+                        }
+                    }
+                }
+            },
+        ]))
+
+        print("DEBUG effective_start:", effective_start)
+        print("DEBUG month_end:", month_end)
+        print("DEBUG working_days_result:", working_days_result)
+
+        if working_days_result:
+            working_days = working_days_result[0]["working_days"]
+
+
+    # Aggregate attendance metrics from stored derived values.
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {
+                    "$gte": month_start.isoformat(),
+                    "$lte": month_end.isoformat(),
+                },
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {
+                                        "$gte": [
+                                            {
+                                                "$dayOfWeek": {
+                                                    "$dateFromString": {
+                                                        "dateString": "$date",
+                                                    }
+                                                }
+                                            },
+                                            2,
+                                        ]
+                                    },
+                                    {
+                                        "$lte": [
+                                            {
+                                                "$dayOfWeek": {
+                                                    "$dateFromString": {
+                                                        "dateString": "$date",
+                                                    }
+                                                }
+                                            },
+                                            6,
+                                        ]
+                                    },
+                                ]
+                            },
+                            {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1]},
+                            0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {
+                        "$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "total_overtime_minutes": {
+                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                },
+            }
+        },
+    ]
+
+    results = list(db.attendance_logs.aggregate(pipeline))
+    metrics = results[0] if results else {}
+
+    present_days = metrics.get("present_days", 0)
+    attendance_pct = (
+        round_half_up(present_days * 100 / working_days, 2)
+        if working_days
+        else None
+    )
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": metrics.get("leave_days", 0),
+        "late_count": metrics.get("late_count", 0),
+        "total_late_minutes": metrics.get("total_late_minutes", 0),
+        "total_overtime_minutes": metrics.get("total_overtime_minutes", 0),
+        "attendance_pct": attendance_pct,
+    }
 
 
 
