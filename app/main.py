@@ -334,34 +334,79 @@ def punch_in(body: PunchInIn):
 
 
 
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
+    # Validate date filters
+    try:
+        if date_from:
+            date.fromisoformat(date_from)
+        if date_to:
+            date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Dates must use YYYY-MM-DD format",
+        )
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from cannot be after date_to",
+        )
+
+    # Build MongoDB filters
     q = {}
+
     if emp_code:
         q["emp_code"] = emp_code
+
     if date_from or date_to:
-        q["date"] = {}
+        date_filter = {}
         if date_from:
-            q["date"]["$gte"] = date_from
+            date_filter["$gte"] = date_from
         if date_to:
-            q["date"]["$lte"] = date_to
+            date_filter["$lte"] = date_to
+        q["date"] = date_filter
+
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
+    # Count all records matching the filters
+    total = db.attendance_logs.count_documents(q)
+
+    # Filter, sort and paginate inside MongoDB
+    cursor = (
+        db.attendance_logs.find(q, {"_id": 0})
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    items = list(cursor)
+
+    # Convert BSON datetimes to epoch milliseconds for the API
+    for item in items:
+        for field in ("punch_in", "punch_out"):
+            value = item.get(field)
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                item[field] = int(value.timestamp() * 1000)
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 
