@@ -1003,6 +1003,121 @@ def department_summary_analytics(
 
 
 
+
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard_analytics(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = Query(None),
+):
+    year, month_number = map(int, month.split("-"))
+    month_start = date(year, month_number, 1).isoformat()
+    month_end = date(
+        year,
+        month_number,
+        monthrange(year, month_number)[1],
+    ).isoformat()
+
+    pipeline = [
+        # Only include employees who exist, and apply department filtering
+        # before ranking so ranks are calculated within that department.
+        *(
+            [{"$match": {"department": department}}]
+            if department is not None
+            else []
+        ),
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$emp_code", "$$code"]},
+                                    {"$gte": ["$date", month_start]},
+                                    {"$lte": ["$date", month_end]},
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total_late_minutes": {
+                                "$sum": {"$ifNull": ["$late_minutes", 0]}
+                            },
+                            "late_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$gt": [
+                                                {"$ifNull": ["$late_minutes", 0]},
+                                                0,
+                                            ]
+                                        },
+                                        1,
+                                        0,
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                ],
+                "as": "late_stats",
+            }
+        },
+        {
+            "$set": {
+                "total_late_minutes": {
+                    "$ifNull": [
+                        {"$arrayElemAt": ["$late_stats.total_late_minutes", 0]},
+                        0,
+                    ]
+                },
+                "late_count": {
+                    "$ifNull": [
+                        {"$arrayElemAt": ["$late_stats.late_count", 0]},
+                        0,
+                    ]
+                },
+            }
+        },
+        # Employees with zero late minutes are not on the leaderboard.
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        # Competition ranking: tied totals share a rank, and ranks are skipped.
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {"rank": {"$rank": {}}},
+            }
+        },
+        # Apply the limit after ranking to preserve ties at the cutoff.
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "emp_code": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": 1,
+                "name": 1,
+                "department": 1,
+                "total_late_minutes": 1,
+                "late_count": 1,
+            }
+        },
+    ]
+
+    items = list(db.employees.aggregate(pipeline))
+    return {"month": month, "items": items}
+
+
+
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
