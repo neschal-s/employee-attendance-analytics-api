@@ -13,7 +13,7 @@ from datetime import date,datetime, timedelta, timezone
 from typing import Optional,Literal
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Path
 from pydantic import BaseModel
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -242,6 +242,69 @@ class PunchOutIn(BaseModel):
             )
 
         return value
+
+
+
+
+
+class RegularizeRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: Optional[
+        Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
+    ] = None
+
+    punch_in: Optional[int] = None
+    punch_out: Optional[int] = None
+
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @field_validator("punch_in", "punch_out")
+    @classmethod
+    def validate_timestamps(
+        cls, value: Optional[int]
+    ) -> Optional[int]:
+        if value is None:
+            return value
+
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                "Timestamp must be an epoch-millisecond integer"
+            )
+
+        if value < 100_000_000_000:
+            raise ValueError(
+                "Timestamp must be an epoch-millisecond timestamp"
+            )
+
+        try:
+            datetime.fromtimestamp(value // 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            raise ValueError(
+                "Timestamp is outside the supported range"
+            )
+
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 5:
+            raise ValueError("Reason must contain at least 5 characters")
+        return value
+
+    @field_validator("regularized_by")
+    @classmethod
+    def validate_regularized_by(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("regularized_by cannot be blank")
+        return value
+
+
+
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -601,6 +664,304 @@ def punch_out(body: PunchOutIn):
 
 
 
+
+
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str,
+    body: RegularizeRequest,
+    date_str: str = Path(alias="date"),
+):
+
+    # Validate the employee code and canonical YYYY-MM-DD date.
+    if not re.fullmatch(r"EMP\d{4,6}", emp_code):
+        raise HTTPException(status_code=422, detail="Invalid employee code")
+
+    try:
+        attendance_date = date.fromisoformat(date_str)
+        if attendance_date.isoformat() != date_str:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Date must use YYYY-MM-DD format",
+        )
+
+    employee = db.employees.find_one({"emp_code": emp_code})
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    record = db.attendance_logs.find_one(
+        {"emp_code": emp_code, "date": date_str}
+    )
+    if not record:
+        raise HTTPException(
+            status_code=404,
+            detail="Attendance record not found",
+        )
+
+    # Only explicitly supplied fields may be changed.
+    supplied = body.model_fields_set
+    if not supplied.intersection({"status", "punch_in", "punch_out"}):
+        raise HTTPException(
+            status_code=422,
+            detail="Request must change at least one attendance field",
+        )
+
+    old_status = record["status"]
+    old_in = record.get("punch_in")
+    old_out = record.get("punch_out")
+
+    # Normalize stored BSON datetimes to UTC and whole seconds.
+    def normalize_dt(value):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(microsecond=0)
+
+    old_in = normalize_dt(old_in)
+    old_out = normalize_dt(old_out)
+
+    new_status = body.status if "status" in supplied else old_status
+    new_in = (
+        datetime.fromtimestamp(body.punch_in // 1000, timezone.utc)
+        if "punch_in" in supplied and body.punch_in is not None
+        else old_in
+    )
+    new_out = (
+        datetime.fromtimestamp(body.punch_out // 1000, timezone.utc)
+        if "punch_out" in supplied and body.punch_out is not None
+        else old_out
+    )
+
+    # Explicit null timestamps are not accepted as a way to clear a punch.
+    # ABSENT and LEAVE clear both timestamps automatically.
+    
+    if (
+        ("punch_in" in supplied and body.punch_in is None)
+        or ("punch_out" in supplied and body.punch_out is None)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="punch_in and punch_out cannot be null when supplied",
+        )
+
+    if new_status in ("ABSENT", "LEAVE"):
+        if (
+            ("punch_in" in supplied and body.punch_in is not None)
+            or ("punch_out" in supplied and body.punch_out is not None)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot supply punch times with ABSENT or LEAVE",
+            )
+        new_in = None
+        new_out = None
+    else:
+        if new_in is None:
+            raise HTTPException(
+                status_code=422,
+                detail="A presence status requires punch_in",
+            )
+
+        # The punch-in must fall on the record's IST attendance date.
+        if new_in.astimezone(IST).date() != attendance_date:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must fall on the attendance date in IST",
+            )
+
+        if new_out is not None:
+            elapsed = (new_out - new_in).total_seconds()
+            if elapsed <= 0 or elapsed > 24 * 60 * 60:
+                raise HTTPException(
+                    status_code=422,
+                    detail="punch_out must be after punch_in and within 24 hours",
+                )
+
+    # Recompute derived fields from the final status and punch times.
+    presence_statuses = {"PRESENT", "WFH", "ON_DUTY"}
+    if new_status in presence_statuses and new_in is not None:
+        punch_in_ist = new_in.astimezone(IST)
+        shift_start_hour, shift_start_minute = map(
+            int, employee["shift_start"].split(":")
+        )
+        shift_start = punch_in_ist.replace(
+            hour=shift_start_hour,
+            minute=shift_start_minute,
+            second=0,
+            microsecond=0,
+        )
+        late_seconds = (punch_in_ist - shift_start).total_seconds()
+        late_minutes = (
+            int(late_seconds // 60) if late_seconds > 600 else 0
+        )
+    else:
+        late_minutes = 0
+
+    work_hours = None
+    overtime_minutes = 0
+    half_day = False
+
+    if new_in is not None and new_out is not None:
+        elapsed_seconds = (new_out - new_in).total_seconds()
+        work_hours = float(
+            (
+                Decimal(str(elapsed_seconds)) / Decimal("3600")
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
+        half_day = work_hours < 4.50
+
+        shift_end_hour, shift_end_minute = map(
+            int, employee["shift_end"].split(":")
+        )
+        shift_start_hour, shift_start_minute = map(
+            int, employee["shift_start"].split(":")
+        )
+        shift_end = punch_in_ist.replace(
+            hour=shift_end_hour,
+            minute=shift_end_minute,
+            second=0,
+            microsecond=0,
+        )
+
+        if (shift_end_hour, shift_end_minute) <= (
+            shift_start_hour, shift_start_minute
+        ):
+            shift_end += timedelta(days=1)
+        if shift_end <= punch_in_ist:
+            shift_end += timedelta(days=1)
+
+        overtime_seconds = (
+            new_out - shift_end.astimezone(timezone.utc)
+        ).total_seconds()
+        if overtime_seconds >= 1800:
+            overtime_minutes = int(overtime_seconds // 60)
+
+    old_derived = {
+        "work_hours": record.get("work_hours"),
+        "late_minutes": record.get("late_minutes", 0),
+        "overtime_minutes": record.get("overtime_minutes", 0),
+        "half_day": record.get("half_day", False),
+    }
+    new_derived = {
+        "work_hours": work_hours,
+        "late_minutes": late_minutes,
+        "overtime_minutes": overtime_minutes,
+        "half_day": half_day,
+    }
+
+    # Construct history with only fields whose values actually changed.
+    def epoch_ms(value):
+        return int(value.timestamp() * 1000) if value is not None else None
+
+    changes = {}
+
+    if old_status != new_status:
+        changes["status"] = {"from": old_status, "to": new_status}
+    if old_in != new_in:
+        changes["punch_in"] = {
+            "from": epoch_ms(old_in),
+            "to": epoch_ms(new_in),
+        }
+    if old_out != new_out:
+        changes["punch_out"] = {
+            "from": epoch_ms(old_out),
+            "to": epoch_ms(new_out),
+        }
+
+    for field, new_value in new_derived.items():
+        old_value = old_derived[field]
+        if old_value != new_value:
+            changes[field] = {"from": old_value, "to": new_value}
+
+    if not changes:
+        raise HTTPException(
+            status_code=422,
+            detail="Request does not change the attendance record",
+        )
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    history_entry = {
+        "at": now,
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # Compare the original editable fields and history to detect races.
+    original_filter = {
+        "_id": record["_id"],
+        "status": record["status"],
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+        "history": record.get("history", []),
+    }
+
+    result = db.attendance_logs.update_one(
+        original_filter,
+        {
+            "$set": {
+                "status": new_status,
+                "punch_in": new_in,
+                "punch_out": new_out,
+                **new_derived,
+            },
+            "$push": {"history": history_entry},
+        },
+    )
+
+    if result.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record changed concurrently; retry the request",
+        )
+
+    updated = db.attendance_logs.find_one({"_id": record["_id"]})
+    return {
+        "emp_code": updated["emp_code"],
+        "date": updated["date"],
+        "status": updated["status"],
+        "punch_in": epoch_ms(normalize_dt(updated.get("punch_in"))),
+        "punch_out": epoch_ms(normalize_dt(updated.get("punch_out"))),
+        "work_hours": updated.get("work_hours"),
+        "late_minutes": updated.get("late_minutes", 0),
+        "overtime_minutes": updated.get("overtime_minutes", 0),
+        "half_day": updated.get("half_day", False),
+        "history": [
+            {
+                **entry,
+                "at": epoch_ms(normalize_dt(entry["at"])),
+            }
+            for entry in updated.get("history", [])
+        ],
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly_analytics(
     emp_code: str,
@@ -677,10 +1038,6 @@ def employee_monthly_analytics(
                 }
             },
         ]))
-
-        print("DEBUG effective_start:", effective_start)
-        print("DEBUG month_end:", month_end)
-        print("DEBUG working_days_result:", working_days_result)
 
         if working_days_result:
             working_days = working_days_result[0]["working_days"]
@@ -2119,7 +2476,6 @@ def explain_endpoint(
             "collection": "employees",
             "explain": explain_json,
         }
-
 
 
     raise HTTPException(
