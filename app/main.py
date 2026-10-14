@@ -114,14 +114,63 @@ def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
 
 
 
+
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    elapsed_hours = (
+        Decimal(str((punch_out - punch_in).total_seconds())) / Decimal("3600")
+    )
+    return float(
+        elapsed_hours.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+
+def compute_overtime(
+    punch_in: datetime,
+    punch_out: datetime,
+    shift_start: str,
+    shift_end: str,
+) -> int:
+    """Return overtime minutes after at least 30 minutes beyond shift end."""
+    punch_in_ist = punch_in.astimezone(IST)
+    punch_out_utc = punch_out.astimezone(timezone.utc)
+
+    shift_start_hour, shift_start_minute = map(
+        int, shift_start.split(":")
+    )
+    shift_end_hour, shift_end_minute = map(
+        int, shift_end.split(":")
+    )
+
+    shift_end_ist = punch_in_ist.replace(
+        hour=shift_end_hour,
+        minute=shift_end_minute,
+        second=0,
+        microsecond=0,
+    )
+
+    # Equal or earlier end time means the shift crosses midnight.
+    if (shift_end_hour, shift_end_minute) <= (
+        shift_start_hour, shift_start_minute
+    ):
+        shift_end_ist += timedelta(days=1)
+
+    # Also handle punch-ins that occur after the shift-end clock time.
+    if shift_end_ist <= punch_in_ist:
+        shift_end_ist += timedelta(days=1)
+
+    overtime_seconds = (
+        punch_out_utc - shift_end_ist.astimezone(timezone.utc)
+    ).total_seconds()
+
+    if overtime_seconds < 30 * 60:
+        return 0
+
+    return int(overtime_seconds // 60)
+
 
 def round_half_up(value, places=2):
     """Round a numeric value using the assignment's HALF_UP rule."""
@@ -147,6 +196,17 @@ def count_working_days(start_date, end_date):
 
     return days
 
+
+
+
+
+
+def epoch_ms_to_utc_seconds(timestamp_ms: int) -> datetime:
+    """Convert epoch milliseconds to a UTC datetime truncated to seconds."""
+    return datetime.fromtimestamp(
+        timestamp_ms // 1000,
+        tz=timezone.utc,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -372,10 +432,7 @@ def punch_in(body: PunchInIn):
     # Convert the supplied epoch milliseconds to UTC.
     # If omitted, use the current UTC time.
     if body.punched_at is not None:
-        ts = datetime.fromtimestamp(
-            body.punched_at // 1000,
-            tz=timezone.utc,
-        )
+        ts = epoch_ms_to_utc_seconds(body.punched_at)
     else:
         ts = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -514,10 +571,7 @@ def punch_out(body: PunchOutIn):
         raise HTTPException(status_code=404, detail="Employee not found")
 
     if body.punched_at is not None:
-        punched_out = datetime.fromtimestamp(
-            body.punched_at // 1000,
-            tz=timezone.utc,
-        )
+        punched_out = epoch_ms_to_utc_seconds(body.punched_at)
     else:
         punched_out = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -580,47 +634,15 @@ def punch_out(body: PunchOutIn):
         )
 
     # Round work hours to 2 decimal places using ROUND_HALF_UP.
-    hours_decimal = (
-        Decimal(str(elapsed_seconds)) / Decimal("3600")
-    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    work_hours = float(hours_decimal)
+    work_hours = compute_work_hours(punch_in_time, punched_out)
 
     # Calculate the applicable shift-end instant.
-    shift_end_hour, shift_end_minute = map(
-        int, emp["shift_end"].split(":")
+    overtime_minutes = compute_overtime(
+        punch_in_time,
+        punched_out,
+        emp["shift_start"],
+        emp["shift_end"],
     )
-
-    punch_in_ist = punch_in_time.astimezone(IST)
-    shift_end = punch_in_ist.replace(
-        hour=shift_end_hour,
-        minute=shift_end_minute,
-        second=0,
-        microsecond=0,
-    )
-
-    # An overnight shift ends on the following calendar day.
-    shift_start_hour, shift_start_minute = map(
-        int, emp["shift_start"].split(":")
-    )
-    if (shift_end_hour, shift_end_minute) <= (
-        shift_start_hour, shift_start_minute
-    ):
-        shift_end += timedelta(days=1)
-
-    # If the punch-in is before the shift-end clock time on an
-    # overnight shift, shift_end may need to be on the next day.
-    if shift_end <= punch_in_ist:
-        shift_end += timedelta(days=1)
-
-    shift_end_utc = shift_end.astimezone(timezone.utc)
-    overtime_seconds = (punched_out - shift_end_utc).total_seconds()
-
-    # Overtime is counted only if the employee works at least 30
-    # minutes beyond the shift end.
-    if overtime_seconds >= 30 * 60:
-        overtime_minutes = int(overtime_seconds // 60)
-    else:
-        overtime_minutes = 0
 
     half_day = work_hours < 4.50
 
@@ -724,22 +746,21 @@ def regularize_attendance(
 
     old_in = normalize_dt(old_in)
     old_out = normalize_dt(old_out)
-
     new_status = body.status if "status" in supplied else old_status
+
     new_in = (
-        datetime.fromtimestamp(body.punch_in // 1000, timezone.utc)
+        epoch_ms_to_utc_seconds(body.punch_in)
         if "punch_in" in supplied and body.punch_in is not None
         else old_in
     )
     new_out = (
-        datetime.fromtimestamp(body.punch_out // 1000, timezone.utc)
+        epoch_ms_to_utc_seconds(body.punch_out)
         if "punch_out" in supplied and body.punch_out is not None
         else old_out
     )
 
     # Explicit null timestamps are not accepted as a way to clear a punch.
     # ABSENT and LEAVE clear both timestamps automatically.
-    
     if (
         ("punch_in" in supplied and body.punch_in is None)
         or ("punch_out" in supplied and body.punch_out is None)
@@ -748,6 +769,7 @@ def regularize_attendance(
             status_code=422,
             detail="punch_in and punch_out cannot be null when supplied",
         )
+
 
     if new_status in ("ABSENT", "LEAVE"):
         if (
@@ -807,39 +829,16 @@ def regularize_attendance(
     half_day = False
 
     if new_in is not None and new_out is not None:
-        elapsed_seconds = (new_out - new_in).total_seconds()
-        work_hours = float(
-            (
-                Decimal(str(elapsed_seconds)) / Decimal("3600")
-            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        )
+        work_hours = compute_work_hours(new_in, new_out)
         half_day = work_hours < 4.50
 
-        shift_end_hour, shift_end_minute = map(
-            int, employee["shift_end"].split(":")
-        )
-        shift_start_hour, shift_start_minute = map(
-            int, employee["shift_start"].split(":")
-        )
-        shift_end = punch_in_ist.replace(
-            hour=shift_end_hour,
-            minute=shift_end_minute,
-            second=0,
-            microsecond=0,
+        overtime_minutes = compute_overtime(
+            new_in,
+            new_out,
+            employee["shift_start"],
+            employee["shift_end"],
         )
 
-        if (shift_end_hour, shift_end_minute) <= (
-            shift_start_hour, shift_start_minute
-        ):
-            shift_end += timedelta(days=1)
-        if shift_end <= punch_in_ist:
-            shift_end += timedelta(days=1)
-
-        overtime_seconds = (
-            new_out - shift_end.astimezone(timezone.utc)
-        ).total_seconds()
-        if overtime_seconds >= 1800:
-            overtime_minutes = int(overtime_seconds // 60)
 
     old_derived = {
         "work_hours": record.get("work_hours"),
