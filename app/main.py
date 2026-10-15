@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
         name="idx_employees_department_emp_code",
     )
 
-    
+
     # Support headcount queries filtered by employee join date.
     db.employees.create_index(
         [("joined_on", 1)],
@@ -207,6 +207,15 @@ def epoch_ms_to_utc_seconds(timestamp_ms: int) -> datetime:
         timestamp_ms // 1000,
         tz=timezone.utc,
     )
+
+
+
+def datetime_to_epoch_ms(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return int(value.timestamp() * 1000)
 
 
 # --------------------------------------------------------------------------- #
@@ -400,9 +409,8 @@ def create_employee(body: EmployeeIn):
         )
 
     doc.pop("_id", None)
+    doc["created_at"] = datetime_to_epoch_ms(doc.get("created_at"))
     return doc
-
-
 
 
 
@@ -417,8 +425,22 @@ def list_employees(
         q["department"] = department
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
-    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    items = list(
+        db.employees.find(q, {"_id": 0})
+        .sort("emp_code", 1)
+        .skip(skip)
+        .limit(page_size)
+    )
+
+    for item in items:
+        item["created_at"] = datetime_to_epoch_ms(item.get("created_at"))
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 
@@ -493,21 +515,24 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[
+    Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
+    ] = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
-    # Validate date filters
+    # Validate exact YYYY-MM-DD date format.
     try:
-        if date_from:
-            date.fromisoformat(date_from)
-        if date_to:
-            date.fromisoformat(date_to)
+        if date_from and date.fromisoformat(date_from).isoformat() != date_from:
+            raise ValueError
+        if date_to and date.fromisoformat(date_to).isoformat() != date_to:
+            raise ValueError
     except ValueError:
         raise HTTPException(
             status_code=422,
             detail="Dates must use YYYY-MM-DD format",
         )
+
 
     if date_from and date_to and date_from > date_to:
         raise HTTPException(
@@ -546,13 +571,35 @@ def list_attendance(
     items = list(cursor)
 
     # Convert BSON datetimes to epoch milliseconds for the API
+        # Normalize attendance records to the API response contract.
+    def to_epoch_ms(value):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return int(value.timestamp() * 1000)
+        return value
+
     for item in items:
+        item.setdefault("work_hours", None)
+        item.setdefault("late_minutes", 0)
+        item.setdefault("overtime_minutes", 0)
+        item.setdefault("half_day", False)
+        item.setdefault("history", [])
+
         for field in ("punch_in", "punch_out"):
-            value = item.get(field)
-            if isinstance(value, datetime):
-                if value.tzinfo is None:
-                    value = value.replace(tzinfo=timezone.utc)
-                item[field] = int(value.timestamp() * 1000)
+            item[field] = to_epoch_ms(item.get(field))
+
+        for entry in item["history"]:
+            if "at" in entry:
+                entry["at"] = to_epoch_ms(entry["at"])
+
+            for change in entry.get("changes", {}).values():
+                if isinstance(change, dict):
+                    for field in ("from", "to"):
+                        if field in change:
+                            change[field] = to_epoch_ms(change[field])
 
     return {
         "items": items,
@@ -934,26 +981,26 @@ def regularize_attendance(
             {
                 **entry,
                 "at": epoch_ms(normalize_dt(entry["at"])),
+                "changes": {
+                    field: {
+                        key: (
+                            epoch_ms(normalize_dt(value))
+                            if field in ("punch_in", "punch_out")
+                            and key in ("from", "to")
+                            and isinstance(value, datetime)
+                            else value
+                        )
+                        for key, value in change.items()
+                    }
+                    if isinstance(change, dict)
+                    else change
+                    for field, change in entry.get("changes", {}).items()
+                },
             }
             for entry in updated.get("history", [])
         ],
+
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1485,12 +1532,10 @@ def late_leaderboard_analytics(
 
 def build_department_trend_pipeline(department, date_from, date_to):
     return [
-        {
-            "$documents": [
-                {"date": (date_from + timedelta(days=i)).isoformat()}
-                for i in range((date_to - date_from).days + 1)
-            ]
-        },
+                    {"$documents": [
+            {"date": (date_from + timedelta(days=i)).isoformat()}
+            for i in range((date_to - date_from).days + 1)
+    ]},
         {
             "$lookup": {
                 "from": "employees",
@@ -1653,8 +1698,8 @@ def build_department_trend_pipeline(department, date_from, date_to):
 @app.get("/analytics/departments/{department}/trend")
 def department_trend_analytics(
     department: str,
-    date_from: date = Query(...),
-    date_to: date = Query(...),
+    date_from: date = Query(..., alias="from"),
+    date_to: date = Query(..., alias="to"),
 ):
     if date_to < date_from:
         raise HTTPException(
@@ -1688,7 +1733,7 @@ def department_trend_analytics(
         department, date_from, date_to
     )
 
-    
+
 
     results = list(db.command({
         "aggregate": 1,
@@ -1814,7 +1859,7 @@ def explain_endpoint(
             .limit(page_size)
         )
 
-        
+
         explain = db.command({
             "explain": {
                 "find": "attendance_logs",
@@ -1837,7 +1882,7 @@ def explain_endpoint(
         }
 
 
-    
+
     if endpoint == "employee_monthly":
         employee = db.employees.find_one(
             {"emp_code": emp_code},
@@ -2024,7 +2069,7 @@ def explain_endpoint(
 
 
 
-    
+
     if endpoint == "department_summary":
         year, month_number = map(int, month.split("-"))
         month_start = date(year, month_number, 1)
@@ -2314,7 +2359,7 @@ def explain_endpoint(
 
 
 
-    
+
     if endpoint == "late_leaderboard":
         year, month_number = map(int, month.split("-"))
         month_start = date(year, month_number, 1).isoformat()
@@ -2447,7 +2492,7 @@ def explain_endpoint(
 
 
 
-    
+
     if endpoint == "department_trend":
         start_date = from_.isoformat()
         end_date = to.isoformat()
@@ -2456,8 +2501,8 @@ def explain_endpoint(
         pipeline = build_department_trend_pipeline(
             department, from_, to
         )
-       
-                
+
+
         explain = db.command({
             "aggregate": 1,
             "pipeline": pipeline,
@@ -2465,7 +2510,7 @@ def explain_endpoint(
             "explain": True,
         })
 
-        
+
         explain_json = json.loads(json_util.dumps(explain))
 
 
