@@ -8,22 +8,30 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+
 import os
-from datetime import date,datetime, timedelta, timezone
-from typing import Optional,Literal
+import re
+import json
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Literal, Optional
 from contextlib import asynccontextmanager
+from calendar import monthrange
+from decimal import Decimal, ROUND_HALF_UP
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Path
-from pydantic import BaseModel
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
-import re
-from datetime import date
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
-from decimal import Decimal, ROUND_HALF_UP
-from calendar import monthrange
-import json
 from bson import json_util
+
 
 
 load_dotenv()
@@ -371,6 +379,7 @@ class RegularizeRequest(BaseModel):
         if not value:
             raise ValueError("regularized_by cannot be blank")
         return value
+
 
 
 
