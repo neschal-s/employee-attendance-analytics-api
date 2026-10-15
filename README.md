@@ -1,26 +1,120 @@
-# Candidate kit
+# Attendance Management API
 
-Read in this order:
+A REST API built with **FastAPI** and **MongoDB** for employee management, daily attendance, shift-based attendance calculations, and attendance analytics.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Features
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+- Employee creation and employee listing with filtering and pagination.
+- Attendance punch-in and punch-out with duplicate and concurrency protection.
+- Attendance listing with date, employee, and status filters.
+- Attendance regularization with change history.
+- Monthly employee attendance summaries.
+- Department-level attendance summaries and headcount analytics.
+- Late-arrival leaderboard with ranking and tie handling.
+- Daily department attendance trends with moving averages.
+- MongoDB query-plan inspection through an explain endpoint.
+- Environment-based MongoDB configuration and indexes created at application startup.
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
+## Requirements
+
+- Python 3.10 or newer.
+- MongoDB 6.0 or newer.
+- Dependencies listed in `requirements.txt`.
+
+## Setup
+
+Clone the repository and navigate to the project directory.
+
+### Windows PowerShell
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
 ```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+If PowerShell blocks virtual-environment activation, run the following in the current terminal and activate again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\.venv\Scripts\Activate.ps1
+```
+
+### Linux/macOS
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## MongoDB Configuration
+
+Set the following environment variables before starting the application:
+
+| Variable | Description | Default |
+|---|---|---|
+| `MONGO_URI` | MongoDB connection URI | `mongodb://localhost:27017` |
+| `MONGO_DB` | Database name | `attendance_db` |
+
+For example, in Windows PowerShell:
+
+```powershell
+$env:MONGO_URI = "mongodb://localhost:27017"
+$env:MONGO_DB = "attendance_db"
+```
+
+For Linux/macOS:
+
+```bash
+export MONGO_URI="mongodb://localhost:27017"
+export MONGO_DB="attendance_db"
+```
+
+Ensure MongoDB is running and accessible before starting the API. For MongoDB Atlas, set `MONGO_URI` to your connection URI and keep credentials out of source control.
+
+## Run the Application
+
+From the repository root, run:
+
+```bash
+uvicorn app.main:app --port 8000
+```
+
+The API will be available at:
+
+- **Swagger UI:** http://localhost:8000/docs
+- **OpenAPI schema:** http://localhost:8000/openapi.json
+- **Health endpoint:** http://localhost:8000/health
+
+Check the health endpoint:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health
+```
+
+A successful response is:
+
+```json
+{"status":"ok"}
+```
+
+## Database Indexes
+
+The application creates its indexes at startup. These include unique indexes for employee codes and employee/date attendance records, along with indexes supporting employee filtering, join-date queries, and attendance-date queries.
+
+## API Contract
+
+Refer to `openapi.yaml` for the endpoint definitions and API contract. The implementation is contained in `app/main.py`.
+
+## Assignment Documentation
+
+- `REVIEW.md` — review of the original starter implementation and identified defects.
+- `DECISIONS.md` — implementation and design decisions.
+- `PROBLEM_STATEMENT.docx` — original assignment requirements.
+- `DATA_MODEL.md` — MongoDB data model.
+- `openapi.yaml` — API specification.
+
+## Security
+
+Do not commit `.env` files, MongoDB credentials, access tokens, or other secrets. Configure connection details through environment variables.
