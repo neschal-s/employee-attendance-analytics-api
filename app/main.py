@@ -41,9 +41,6 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
-
-
 
 # --------------------------------------------------------------------------- #
 # MongoDB indexes and application lifecycle
@@ -1767,12 +1764,6 @@ def department_trend_analytics(
     }
 
 
-    return {
-        "department": department,
-        "items": results,
-    }
-
-
 
 
 
@@ -2538,15 +2529,3 @@ def explain_endpoint(
 
 
 
-
-
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
